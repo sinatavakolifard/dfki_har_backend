@@ -82,100 +82,68 @@ not.
 
 ## Flutter integration
 
-Add to `pubspec.yaml`:
+The sibling [`dfki_human_activity_recognition`](../dfki_human_activity_recognition)
+app already ships a `HarApi` client at
+`lib/services/har_api.dart` (uses `http` + `crypto`; compresses with
+`dart:io`'s `gzip` and uploads multipart). End-to-end wiring on the app
+side:
 
-```yaml
-  http: ^1.2.2
-  crypto: ^3.0.5
+1. **Set the server URL + key.** In the app, open Preferences → *Backend
+   uploads* and fill in:
+   - **Server base URL** — e.g. `http://10.0.2.2:8000` for the Android
+     emulator, `http://localhost:8000` for the iOS simulator, or the LAN /
+     public URL of the deployed API.
+   - **API key** — the `HAR_API_KEY` value from this repo's `.env`.
+
+   Tap **Test connection** to verify; on success the app stores both
+   values.
+
+2. **Opt in to uploads.** Flip the *Upload recordings* switch. From then
+   on, every Stop sends the gzipped CSV; failures keep the local CSV so the
+   user can retry from the Sessions list (popup menu → *Upload to
+   backend*).
+
+3. **Re-upload / migrate older recordings.** The same popup menu has an
+   *Upload to backend* action per session.
+
+Cleartext HTTP is fine for local development, but Android release builds
+block it by default. For anything reachable from another host, put the API
+behind TLS (see *Deploying*) — `X-API-Key` is transmitted in plaintext
+otherwise.
+
+## Inspecting stored data
+
+The compose file binds Postgres to `127.0.0.1:5432` (creds from
+`.env` / `.env.example` — default `har` / `har-dev-password`).
+
+```bash
+docker compose exec db psql -U har -d har
 ```
 
-Helper that compresses + uploads a session CSV from the HAR app:
+Once in psql:
 
-```dart
-import 'dart:convert';
-import 'dart:io';
-import 'dart:typed_data';
+```sql
+\dt                                   -- users, sessions, alembic_version
+SELECT id, age, gender, updated_at FROM users;
 
-import 'package:crypto/crypto.dart';
-import 'package:http/http.dart' as http;
-
-class HarApi {
-  HarApi({required this.baseUrl, required this.apiKey});
-
-  final Uri baseUrl;
-  final String apiKey;
-
-  Future<void> upsertUser({
-    required String userId,
-    int? age,
-    int? heightCm,
-    int? weightKg,
-    String? gender,
-  }) async {
-    final r = await http.put(
-      baseUrl.resolve('/v1/users/$userId'),
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-Key': apiKey,
-      },
-      body: jsonEncode({
-        if (age != null) 'age': age,
-        if (heightCm != null) 'height_cm': heightCm,
-        if (weightKg != null) 'weight_kg': weightKg,
-        if (gender != null) 'gender': gender,
-      }),
-    );
-    if (r.statusCode >= 300) {
-      throw Exception('upsertUser failed: ${r.statusCode} ${r.body}');
-    }
-  }
-
-  Future<void> uploadSession({
-    required String sessionId,
-    required String userId,
-    required DateTime startedAt,
-    required int durationMs,
-    required int sampleCount,
-    required int targetHz,
-    String? description,
-    required File csvFile,
-  }) async {
-    final csvBytes = await csvFile.readAsBytes();
-    final gz = Uint8List.fromList(gzip.encode(csvBytes));
-    final sha = sha256.convert(csvBytes).toString();
-
-    final req = http.MultipartRequest('POST', baseUrl.resolve('/v1/sessions'))
-      ..headers['X-API-Key'] = apiKey
-      ..fields['metadata'] = jsonEncode({
-        'id': sessionId,
-        'user_id': userId,
-        'started_at': startedAt.toUtc().toIso8601String(),
-        'duration_ms': durationMs,
-        'sample_count': sampleCount,
-        'target_hz': targetHz,
-        'description': description,
-        'csv_uncompressed_bytes': csvBytes.length,
-        'csv_sha256': sha,
-      })
-      ..files.add(http.MultipartFile.fromBytes(
-        'file',
-        gz,
-        filename: '$sessionId.csv.gz',
-        contentType: null, // server treats it as application/gzip
-      ));
-
-    final streamed = await req.send();
-    if (streamed.statusCode >= 300) {
-      final body = await streamed.stream.bytesToString();
-      throw Exception('uploadSession failed: ${streamed.statusCode} $body');
-    }
-  }
-}
+-- skip csv_gz, it is the raw gzipped blob
+SELECT id, user_id, started_at, sample_count, csv_uncompressed_bytes,
+       uploaded_at
+  FROM sessions
+  ORDER BY uploaded_at DESC
+  LIMIT 20;
 ```
 
-`gzip` is in `dart:io`, so no extra dependency is needed for compression
-itself. Wire this into the HAR app once the planned upload-consent step is
-in place (see `PROGRESS.md` → "Opt-in uploading deferred").
+Or hit the API directly:
+
+```bash
+KEY=$(grep ^HAR_API_KEY .env | cut -d= -f2)
+curl -s -H "X-API-Key: $KEY" \
+  "http://localhost:8000/v1/sessions?user_id=<uuid>&limit=50" | jq
+```
+
+OpenAPI / Swagger UI lives at `http://localhost:8000/docs` — click
+*Authorize* once and you can browse interactively.
 
 ## Migrations
 
